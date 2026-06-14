@@ -1,0 +1,48 @@
+.kelan-image-uploader-header-row {
+	gap: 8px;
+}
+
+.kelan-image-uploader-header-row input:first-child {
+	min-width: 10em;
+}
+
+a[href^="kelan-image-uploader://"] {
+	display: inline-flex;
+	align-items: center;
+	max-width: 100%;
+	gap: 0.45em;
+	padding: 0.2em 0.65em;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 999px;
+	background: var(--background-secondary);
+	color: var(--text-muted);
+	font-size: 0.9em;
+	line-height: 1.5;
+	text-decoration: none;
+	vertical-align: baseline;
+	white-space: nowrap;
+	pointer-events: none;
+}
+
+a[href^="kelan-image-uploader://"]::before {
+	content: "";
+	width: 0.55em;
+	height: 0.55em;
+	flex: 0 0 auto;
+	border-radius: 50%;
+	background: var(--interactive-accent);
+	animation: kelan-image-uploader-uploading-pulse 1.15s ease-in-out infinite;
+}
+
+@keyframes kelan-image-uploader-uploading-pulse {
+	0%,
+	100% {
+		opacity: 0.35;
+		transform: scale(0.75);
+	}
+
+	50% {
+		opacity: 1;
+		transform: scale(1);
+	}
+}

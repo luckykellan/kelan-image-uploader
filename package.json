@@ -1,0 +1,25 @@
+{
+	"name": "kelan-image-uploader",
+	"version": "1.0.0",
+	"description": "Automatically transform selected, pasted, or dropped Obsidian images, upload them to a configurable API, and insert the returned URL.",
+	"main": "main.js",
+	"type": "module",
+	"scripts": {
+		"dev": "node esbuild.config.mjs",
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+	},
+	"keywords": [
+		"obsidian",
+		"image",
+		"upload",
+		"compress",
+		"api"
+	],
+	"license": "MIT",
+	"devDependencies": {
+		"@types/node": "^22.15.17",
+		"esbuild": "^0.25.5",
+		"obsidian": "^1.13.1",
+		"typescript": "^5.8.3"
+	}
+}
