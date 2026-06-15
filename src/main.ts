@@ -113,7 +113,7 @@ export default class ObsidianImageUploaderPlugin extends Plugin {
 		input.type = 'file';
 		input.accept = 'image/*';
 		input.multiple = true;
-		input.style.display = 'none';
+		input.addClass('kelan-uploader-hidden-file-input');
 
 		const cleanup = () => {
 			input.remove();

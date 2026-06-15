@@ -1,3 +1,7 @@
+.kelan-uploader-hidden-file-input {
+	display: none;
+}
+
 .kelan-uploader-header-row {
 	gap: 8px;
 }
