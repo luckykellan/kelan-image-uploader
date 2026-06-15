@@ -1,0 +1,69 @@
+name: Release Obsidian plugin
+
+on:
+  push:
+    tags:
+      - "*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate Obsidian release metadata
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const tag = process.env.GITHUB_REF_NAME;
+          const manifest = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+          const versions = JSON.parse(fs.readFileSync("versions.json", "utf8"));
+
+          if (!/^\d+\.\d+\.\d+$/.test(tag)) {
+            throw new Error(`Release tag must use x.y.z format, got "${tag}".`);
+          }
+
+          if (manifest.version !== tag) {
+            throw new Error(`Tag "${tag}" must match manifest.json version "${manifest.version}".`);
+          }
+
+          if (versions[tag] !== manifest.minAppVersion) {
+            throw new Error(
+              `versions.json must contain "${tag}": "${manifest.minAppVersion}" for this release.`
+            );
+          }
+          NODE
+
+      - name: Build
+        run: npm run build
+
+      - name: Check release assets
+        run: |
+          test -s main.js
+          test -s manifest.json
+          test -s styles.css
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" main.js manifest.json styles.css \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Release $GITHUB_REF_NAME" \
+            --verify-tag
