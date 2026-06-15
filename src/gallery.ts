@@ -12,10 +12,12 @@ export interface GalleryReplacement {
 const GALLERY_ATTRIBUTE = 'data-kelan-uploader="gallery"';
 const PREVIOUS_GALLERY_ATTRIBUTE = 'data-kelan-image-uploader="gallery"';
 const LEGACY_GALLERY_ATTRIBUTE = 'data-image-upload-pipeline="gallery"';
-const GALLERY_CONTAINER_TAG = 'span';
+const GALLERY_CONTAINER_TAG = 'div';
+const PREVIOUS_GALLERY_CONTAINER_TAG = 'span';
 const GENERATED_IMAGE_TAG =
 	/<img\b(?=[^>]*\b(?:data-kelan-uploader|data-kelan-image-uploader|data-image-upload-pipeline)="gallery")[^>]*>/g;
 const GENERATED_GALLERY_END_TAG = `</${GALLERY_CONTAINER_TAG}>`;
+const PREVIOUS_GENERATED_GALLERY_END_TAG = `</${PREVIOUS_GALLERY_CONTAINER_TAG}>`;
 
 export function createGalleryReplacement(
 	content: string,
@@ -91,12 +93,27 @@ function findAdjacentContentEnd(content: string, offset: number): number | null 
 }
 
 function findGeneratedGalleryEndingAt(content: string, end: number): GalleryMatch | null {
-	if (end < GENERATED_GALLERY_END_TAG.length) return null;
-	if (content.slice(end - GENERATED_GALLERY_END_TAG.length, end).toLowerCase() !== GENERATED_GALLERY_END_TAG) {
-		return null;
-	}
+	return (
+		findGeneratedGalleryContainerEndingAt(content, end, GALLERY_CONTAINER_TAG, GENERATED_GALLERY_END_TAG) ??
+		findGeneratedGalleryContainerEndingAt(
+			content,
+			end,
+			PREVIOUS_GALLERY_CONTAINER_TAG,
+			PREVIOUS_GENERATED_GALLERY_END_TAG,
+		)
+	);
+}
 
-	const openTagStart = content.lastIndexOf(`<${GALLERY_CONTAINER_TAG}`, end - GENERATED_GALLERY_END_TAG.length);
+function findGeneratedGalleryContainerEndingAt(
+	content: string,
+	end: number,
+	tagName: string,
+	endTag: string,
+): GalleryMatch | null {
+	if (end < endTag.length) return null;
+	if (content.slice(end - endTag.length, end).toLowerCase() !== endTag) return null;
+
+	const openTagStart = content.lastIndexOf(`<${tagName}`, end - endTag.length);
 	if (openTagStart < 0) return null;
 
 	const html = content.slice(openTagStart, end);
@@ -106,7 +123,7 @@ function findGeneratedGalleryEndingAt(content: string, end: number): GalleryMatc
 	const openTag = html.slice(0, openTagEnd + 1);
 	if (!hasGeneratedGalleryAttribute(openTag)) return null;
 
-	const body = html.slice(openTagEnd + 1, html.length - GENERATED_GALLERY_END_TAG.length);
+	const body = html.slice(openTagEnd + 1, html.length - endTag.length);
 	const images = parseGeneratedImages(body);
 	if (images.length === 0) return null;
 
@@ -281,24 +298,23 @@ function parseGeneratedImages(value: string): GalleryImage[] {
 }
 
 function renderGallery(images: GalleryImage[]): string {
-	const width = `calc(100% / ${images.length})`;
 	return [
 		`<${GALLERY_CONTAINER_TAG}`,
 		` ${GALLERY_ATTRIBUTE}`,
-		' style="display: flex; align-items: flex-start; gap: 0; width: 100%;"',
+		` style="display: grid; grid-template-columns: repeat(${images.length}, minmax(0, 1fr)); align-items: start; gap: 0; width: 100%; max-width: 100%; overflow: hidden;"`,
 		'>',
-		images.map((image) => renderGalleryImage(image, width)).join(''),
+		images.map(renderGalleryImage).join(''),
 		GENERATED_GALLERY_END_TAG,
 	].join('');
 }
 
-function renderGalleryImage(image: GalleryImage, width: string): string {
+function renderGalleryImage(image: GalleryImage): string {
 	return [
 		'<img',
 		` ${GALLERY_ATTRIBUTE}`,
 		` src="${escapeHtmlAttribute(image.src)}"`,
 		` alt="${escapeHtmlAttribute(image.alt)}"`,
-		` style="display: block; flex: 0 0 ${width}; width: ${width}; max-width: ${width}; min-width: 0; height: auto;"`,
+		' style="display: block; width: 100%; max-width: 100%; min-width: 0; height: auto;"',
 		'>',
 	].join('');
 }

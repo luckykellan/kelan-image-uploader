@@ -17,6 +17,36 @@
 	vertical-align: top;
 }
 
+.markdown-rendered span:where(
+		[data-kelan-uploader="gallery"],
+		[data-kelan-image-uploader="gallery"],
+		[data-image-upload-pipeline="gallery"]
+	) {
+	display: flex !important;
+	align-items: flex-start !important;
+	gap: 0 !important;
+	width: 100% !important;
+	max-width: 100% !important;
+	overflow: hidden !important;
+}
+
+.markdown-rendered span:where(
+		[data-kelan-uploader="gallery"],
+		[data-kelan-image-uploader="gallery"],
+		[data-image-upload-pipeline="gallery"]
+	)
+	> img:where(
+		[data-kelan-uploader="gallery"],
+		[data-kelan-image-uploader="gallery"],
+		[data-image-upload-pipeline="gallery"]
+	) {
+	flex: 1 1 0 !important;
+	width: 0 !important;
+	max-width: none !important;
+	min-width: 0 !important;
+	height: auto !important;
+}
+
 a[href^="kelan-uploader://"] {
 	display: inline-flex;
 	align-items: center;
