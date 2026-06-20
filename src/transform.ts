@@ -1,5 +1,5 @@
 import { ImageTransformSettings, OutputFormat } from './settings';
-import { getExtension, replaceExtension } from './utils';
+import { getExtension, getMimeTypeByExtension, replaceExtension } from './utils';
 
 export interface PreparedUpload {
 	fileName: string;
@@ -16,19 +16,6 @@ interface LoadedImage {
 }
 
 const ENCODABLE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
-const MIME_BY_EXTENSION = new Map<string, string>([
-	['avif', 'image/avif'],
-	['gif', 'image/gif'],
-	['heic', 'image/heic'],
-	['heif', 'image/heif'],
-	['ico', 'image/x-icon'],
-	['jpeg', 'image/jpeg'],
-	['jpg', 'image/jpeg'],
-	['png', 'image/png'],
-	['svg', 'image/svg+xml'],
-	['webp', 'image/webp'],
-]);
-
 export async function prepareImageForUpload(
 	file: File,
 	settings: ImageTransformSettings,
@@ -200,7 +187,7 @@ function getOriginalMimeType(file: File): string {
 	if (normalizedType.startsWith('image/')) return normalizedType;
 
 	const extension = getExtension(file.name);
-	if (extension) return MIME_BY_EXTENSION.get(extension) ?? 'application/octet-stream';
+	if (extension) return getMimeTypeByExtension(extension);
 
 	return 'application/octet-stream';
 }

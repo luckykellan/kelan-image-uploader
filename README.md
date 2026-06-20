@@ -2,11 +2,11 @@
 
 [中文文档](README.zh-CN.md)
 
-An Obsidian plugin for uploading selected, pasted, or dropped images to a configurable `multipart/form-data` API. It can resize, compress, or convert images before upload, then insert the returned image URL into the editor.
+An Obsidian plugin for uploading selected, pasted, dropped, or Obsidian-native attached images to a configurable `multipart/form-data` API. It can resize, compress, or convert images before upload, then insert the returned image URL into the editor.
 
 ## Features
 
-- Upload images from the command palette, paste, or drag-and-drop.
+- Upload images from the command palette, paste, drag-and-drop, or Obsidian-native attachments.
 - Use any compatible `multipart/form-data` upload endpoint.
 - Extract the final URL from JSON responses with paths such as `url`, `data.link`, or `0.src`.
 - Optional resize, compression, and JPEG/PNG/WebP conversion.
@@ -58,7 +58,7 @@ Reload Obsidian and enable **Kelan Image Uploader** in Community plugins.
 
 ## Mobile
 
-On Obsidian Mobile, run **Kelan Image Uploader: Upload images from device** while editing a Markdown note. The command opens the system image picker, then uploads the selected images and inserts the returned URLs at the cursor.
+On Obsidian Mobile, run **Kelan Image Uploader: Upload images from device** while editing a Markdown note, or use Obsidian's native link/attachment button and choose images from the photo library. The plugin uploads the images and inserts the returned URLs at the cursor; local `![[...]]` image embeds inserted by the native attachment flow are replaced automatically.
 
 ## CloudFlare ImgBed Example
 

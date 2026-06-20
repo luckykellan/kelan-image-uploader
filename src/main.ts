@@ -1,9 +1,11 @@
 import {
 	Editor,
-	MarkdownFileInfo,
+	type MarkdownFileInfo,
 	MarkdownView,
 	Notice,
+	parseLinktext,
 	Plugin,
+	type TFile,
 } from 'obsidian';
 import { createGalleryReplacement } from './gallery';
 import { t } from './i18n';
@@ -21,6 +23,9 @@ import {
 	collectImageFilesFromPicker,
 	escapeMarkdownLinkText,
 	escapeMarkdownUrl,
+	getExtension,
+	getMimeTypeByExtension,
+	isImageExtension,
 } from './utils';
 
 interface UploadPlaceholder {
@@ -33,17 +38,45 @@ interface UploadTask {
 	placeholder: UploadPlaceholder;
 }
 
+interface OffsetRange {
+	from: number;
+	to: number;
+}
+
+interface NativeAttachmentEmbed extends OffsetRange {
+	linktext: string;
+}
+
+interface NativeAttachmentReplacement extends OffsetRange {
+	file: File;
+	placeholder: UploadPlaceholder;
+}
+
+interface NativeAttachmentScanResult {
+	replacements: NativeAttachmentReplacement[];
+	hasUnresolvedImageEmbed: boolean;
+}
+
 const UPLOAD_CONCURRENCY = 3;
 const CHANGE_SOURCE = 'kelan-uploader';
 const PLACEHOLDER_PROTOCOL = 'kelan-uploader';
+const NATIVE_ATTACHMENT_EMBED = /!\[\[([^\]\r\n]+)\]\]/g;
+const NATIVE_ATTACHMENT_RETRY_DELAYS = [500, 1500] as const;
 
 export default class ObsidianImageUploaderPlugin extends Plugin {
 	settings: ImageUploaderSettings = DEFAULT_SETTINGS;
 	private uploadSequence = 0;
+	private readonly editorContentSnapshots = new WeakMap<Editor, string>();
+	private processingNativeAttachmentEmbeds = false;
+	private readonly nativeAttachmentRetryTimers = new Set<number>();
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
 		this.addSettingTab(new ImageUploaderSettingTab(this.app, this));
+		this.app.workspace.onLayoutReady(() => this.captureActiveEditorContent());
+		this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.captureActiveEditorContent()));
+		this.registerEvent(this.app.workspace.on('file-open', () => this.captureActiveEditorContent()));
+		this.register(() => this.clearNativeAttachmentRetryTimers());
 
 		this.addCommand({
 			id: 'upload-images-from-device',
@@ -64,6 +97,12 @@ export default class ObsidianImageUploaderPlugin extends Plugin {
 					evt.stopPropagation();
 				},
 			),
+		);
+
+		this.registerEvent(
+			this.app.workspace.on('editor-change', (editor: Editor, info: MarkdownView | MarkdownFileInfo) => {
+				this.handleEditorChange(editor, info);
+			}),
 		);
 
 		this.registerEvent(
@@ -106,6 +145,151 @@ export default class ObsidianImageUploaderPlugin extends Plugin {
 
 		void this.processUploads(editor, tasks);
 		return true;
+	}
+
+	private handleEditorChange(editor: Editor, info: MarkdownView | MarkdownFileInfo): void {
+		const content = editor.getValue();
+		const previousContent = this.editorContentSnapshots.get(editor);
+		this.editorContentSnapshots.set(editor, content);
+
+		if (this.processingNativeAttachmentEmbeds) return;
+
+		const scanRanges = previousContent === undefined
+			? getCursorScanRanges(editor, content)
+			: getChangedScanRanges(previousContent, content);
+		if (scanRanges.length === 0) return;
+
+		void this.processNativeAttachmentEmbeds(editor, info, scanRanges, 0);
+	}
+
+	private async processNativeAttachmentEmbeds(
+		editor: Editor,
+		info: MarkdownView | MarkdownFileInfo,
+		scanRanges: OffsetRange[],
+		retryIndex: number,
+		sourceFileOverride?: TFile,
+	): Promise<void> {
+		if (this.processingNativeAttachmentEmbeds) return;
+
+		this.processingNativeAttachmentEmbeds = true;
+		try {
+			const content = editor.getValue();
+			const ranges = scanRanges.map((range) => expandToLineRange(content, range));
+			if (!rangesContainNativeImageEmbed(content, ranges)) return;
+
+			const validationError = validateUploadSettings(this.settings);
+			if (validationError) {
+				new Notice(validationError);
+				return;
+			}
+
+			const sourceFile = sourceFileOverride ?? info.file ?? this.app.workspace.getActiveFile();
+			if (!sourceFile) return;
+
+			const scanResult = await this.collectNativeAttachmentReplacements(content, sourceFile, ranges);
+			if (scanResult.hasUnresolvedImageEmbed) {
+				this.scheduleNativeAttachmentRescan(editor, info, sourceFile, ranges, retryIndex);
+			}
+			if (scanResult.replacements.length === 0) return;
+
+			const uploadTasks = scanResult.replacements.map((replacement) => ({
+				file: replacement.file,
+				placeholder: replacement.placeholder,
+			}));
+
+			for (const replacement of [...scanResult.replacements].sort((left, right) => right.from - left.from)) {
+				const from = editor.offsetToPos(replacement.from);
+				const to = editor.offsetToPos(replacement.to);
+				editor.replaceRange(replacement.placeholder.markdown, from, to, CHANGE_SOURCE);
+			}
+
+			this.editorContentSnapshots.set(editor, editor.getValue());
+			new Notice(t('notice.uploading', {
+				count: uploadTasks.length,
+				plural: uploadTasks.length === 1 ? '' : 's',
+			}));
+			void this.processUploads(editor, uploadTasks);
+		} finally {
+			this.processingNativeAttachmentEmbeds = false;
+		}
+	}
+
+	private async collectNativeAttachmentReplacements(
+		content: string,
+		sourceFile: TFile,
+		scanRanges: OffsetRange[],
+	): Promise<NativeAttachmentScanResult> {
+		const replacements: NativeAttachmentReplacement[] = [];
+		let hasUnresolvedImageEmbed = false;
+
+		for (const embed of findNativeAttachmentEmbeds(content, scanRanges)) {
+			const linkPath = getWikilinkPath(embed.linktext);
+			if (!linkPath) continue;
+
+			const extension = getExtension(linkPath);
+			if (extension !== null && !isImageExtension(extension)) continue;
+
+			const targetFile = this.app.metadataCache.getFirstLinkpathDest(linkPath, sourceFile.path);
+			if (!targetFile) {
+				if (extension !== null && isImageExtension(extension)) hasUnresolvedImageEmbed = true;
+				continue;
+			}
+			if (!isImageExtension(targetFile.extension)) continue;
+
+			try {
+				const file = await this.createFileFromVaultAttachment(targetFile);
+				replacements.push({
+					from: embed.from,
+					to: embed.to,
+					file,
+					placeholder: this.createPlaceholder(file),
+				});
+			} catch (error) {
+				new Notice(t('notice.uploadFailed', { message: getErrorMessage(error) }));
+			}
+		}
+
+		return {
+			replacements,
+			hasUnresolvedImageEmbed,
+		};
+	}
+
+	private async createFileFromVaultAttachment(file: TFile): Promise<File> {
+		const data = await this.app.vault.readBinary(file);
+		return new File([data], file.name, {
+			type: getMimeTypeByExtension(file.extension),
+		});
+	}
+
+	private scheduleNativeAttachmentRescan(
+		editor: Editor,
+		info: MarkdownView | MarkdownFileInfo,
+		sourceFile: TFile,
+		scanRanges: OffsetRange[],
+		retryIndex: number,
+	): void {
+		const delay = NATIVE_ATTACHMENT_RETRY_DELAYS[retryIndex];
+		if (delay === undefined) return;
+
+		const timer = activeWindow.setTimeout(() => {
+			this.nativeAttachmentRetryTimers.delete(timer);
+			void this.processNativeAttachmentEmbeds(editor, info, scanRanges, retryIndex + 1, sourceFile);
+		}, delay);
+		this.nativeAttachmentRetryTimers.add(timer);
+	}
+
+	private captureActiveEditorContent(): void {
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!view) return;
+		this.editorContentSnapshots.set(view.editor, view.editor.getValue());
+	}
+
+	private clearNativeAttachmentRetryTimers(): void {
+		for (const timer of this.nativeAttachmentRetryTimers) {
+			activeWindow.clearTimeout(timer);
+		}
+		this.nativeAttachmentRetryTimers.clear();
 	}
 
 	private openImagePicker(editor: Editor): void {
@@ -226,6 +410,134 @@ export default class ObsidianImageUploaderPlugin extends Plugin {
 		editor.replaceRange(replacement, from, to, CHANGE_SOURCE);
 		return true;
 	}
+}
+
+function getChangedScanRanges(previousContent: string, content: string): OffsetRange[] {
+	const changedRange = getChangedRange(previousContent, content);
+	if (!changedRange) return [];
+
+	const scanRange = expandToLineRange(content, changedRange);
+	return rangesContainNativeImageEmbed(content, [scanRange]) ? [scanRange] : [];
+}
+
+function getChangedRange(previousContent: string, content: string): OffsetRange | null {
+	if (previousContent === content) return null;
+
+	let prefixLength = 0;
+	const minLength = Math.min(previousContent.length, content.length);
+	while (
+		prefixLength < minLength &&
+		previousContent[prefixLength] === content[prefixLength]
+	) {
+		prefixLength += 1;
+	}
+
+	let previousSuffixStart = previousContent.length;
+	let contentSuffixStart = content.length;
+	while (
+		previousSuffixStart > prefixLength &&
+		contentSuffixStart > prefixLength &&
+		previousContent[previousSuffixStart - 1] === content[contentSuffixStart - 1]
+	) {
+		previousSuffixStart -= 1;
+		contentSuffixStart -= 1;
+	}
+
+	if (contentSuffixStart <= prefixLength) return null;
+	return {
+		from: prefixLength,
+		to: contentSuffixStart,
+	};
+}
+
+function getCursorScanRanges(editor: Editor, content: string): OffsetRange[] {
+	const cursorOffset = editor.posToOffset(editor.getCursor());
+	if (cursorOffset < 0) return [];
+
+	const scanRange = expandToLineRange(content, {
+		from: Math.min(cursorOffset, content.length),
+		to: Math.min(cursorOffset, content.length),
+	});
+	return rangesContainNativeImageEmbed(content, [scanRange]) ? [scanRange] : [];
+}
+
+function expandToLineRange(content: string, range: OffsetRange): OffsetRange {
+	const from = clampOffset(range.from, content.length);
+	const to = clampOffset(range.to, content.length);
+	const lineStart = content.lastIndexOf('\n', Math.max(0, from - 1)) + 1;
+	const nextLineBreak = content.indexOf('\n', to);
+	return {
+		from: lineStart,
+		to: nextLineBreak < 0 ? content.length : nextLineBreak,
+	};
+}
+
+function rangesContainNativeImageEmbed(content: string, ranges: OffsetRange[]): boolean {
+	return findNativeAttachmentEmbeds(content, ranges).some((embed) => {
+		const linkPath = getWikilinkPath(embed.linktext);
+		const extension = linkPath ? getExtension(linkPath) : null;
+		return extension !== null && isImageExtension(extension);
+	});
+}
+
+function findNativeAttachmentEmbeds(content: string, ranges: OffsetRange[]): NativeAttachmentEmbed[] {
+	const embeds: NativeAttachmentEmbed[] = [];
+	const seen = new Set<string>();
+
+	for (const range of ranges) {
+		const from = clampOffset(range.from, content.length);
+		const to = clampOffset(range.to, content.length);
+		if (to <= from) continue;
+
+		NATIVE_ATTACHMENT_EMBED.lastIndex = 0;
+		const slice = content.slice(from, to);
+		let match: RegExpExecArray | null;
+		while ((match = NATIVE_ATTACHMENT_EMBED.exec(slice)) !== null) {
+			const embedFrom = from + match.index;
+			const embedTo = embedFrom + match[0].length;
+			const key = `${embedFrom}:${embedTo}`;
+			if (seen.has(key)) continue;
+
+			seen.add(key);
+			embeds.push({
+				from: embedFrom,
+				to: embedTo,
+				linktext: match[1] ?? '',
+			});
+		}
+	}
+
+	return embeds.sort((left, right) => left.from - right.from);
+}
+
+function getWikilinkPath(linktext: string): string | null {
+	const destination = getWikilinkDestination(linktext);
+	if (!destination) return null;
+
+	const parsed = parseLinktext(destination);
+	const path = parsed.path.trim();
+	return path || null;
+}
+
+function getWikilinkDestination(linktext: string): string {
+	for (let index = 0; index < linktext.length; index += 1) {
+		if (linktext[index] === '|' && !isEscaped(linktext, index)) {
+			return linktext.slice(0, index).trim();
+		}
+	}
+	return linktext.trim();
+}
+
+function isEscaped(value: string, index: number): boolean {
+	let slashCount = 0;
+	for (let cursor = index - 1; cursor >= 0 && value[cursor] === '\\'; cursor -= 1) {
+		slashCount += 1;
+	}
+	return slashCount % 2 === 1;
+}
+
+function clampOffset(offset: number, length: number): number {
+	return Math.min(Math.max(offset, 0), length);
 }
 
 async function runWithConcurrency<T>(

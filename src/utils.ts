@@ -11,6 +11,19 @@ const IMAGE_EXTENSIONS = new Set([
 	'webp',
 ]);
 
+const MIME_BY_EXTENSION = new Map<string, string>([
+	['avif', 'image/avif'],
+	['gif', 'image/gif'],
+	['heic', 'image/heic'],
+	['heif', 'image/heif'],
+	['ico', 'image/x-icon'],
+	['jpeg', 'image/jpeg'],
+	['jpg', 'image/jpeg'],
+	['png', 'image/png'],
+	['svg', 'image/svg+xml'],
+	['webp', 'image/webp'],
+]);
+
 export function collectImageFiles(dataTransfer: DataTransfer | null | undefined): File[] {
 	if (!dataTransfer) return [];
 
@@ -36,13 +49,21 @@ export function collectImageFilesFromPicker(fileList: FileList | null | undefine
 export function isImageFile(file: File): boolean {
 	if (file.type.toLowerCase().startsWith('image/')) return true;
 	const extension = getExtension(file.name);
-	return extension !== null && IMAGE_EXTENSIONS.has(extension);
+	return extension !== null && isImageExtension(extension);
+}
+
+export function isImageExtension(extension: string): boolean {
+	return IMAGE_EXTENSIONS.has(normalizeExtension(extension));
+}
+
+export function getMimeTypeByExtension(extension: string): string {
+	return MIME_BY_EXTENSION.get(normalizeExtension(extension)) ?? 'application/octet-stream';
 }
 
 export function getExtension(fileName: string): string | null {
 	const lastDot = fileName.lastIndexOf('.');
 	if (lastDot < 0 || lastDot === fileName.length - 1) return null;
-	return fileName.slice(lastDot + 1).toLowerCase();
+	return normalizeExtension(fileName.slice(lastDot + 1));
 }
 
 export function replaceExtension(fileName: string, extension: string): string {
@@ -80,6 +101,10 @@ export function getByPath(obj: unknown, path: string): unknown {
 	}
 
 	return current;
+}
+
+function normalizeExtension(extension: string): string {
+	return extension.trim().toLowerCase().replace(/^\./, '');
 }
 
 function collectFilesFromItems(items: DataTransferItemList): File[] {
