@@ -29,9 +29,18 @@ export function createGalleryReplacement(
 	image: GalleryImage,
 	options: GalleryOptions,
 ): GalleryReplacement {
+	return createGalleryReplacementForImages(content, currentRange, [image], options);
+}
+
+export function createGalleryReplacementForImages(
+	content: string,
+	currentRange: { from: number; to: number },
+	insertedImages: GalleryImage[],
+	options: GalleryOptions,
+): GalleryReplacement {
 	const previous = findPreviousGallery(content, currentRange.from);
 	const next = findNextGallery(content, currentRange.to);
-	const images = [...(previous?.images ?? []), image, ...(next?.images ?? [])];
+	const images = [...(previous?.images ?? []), ...insertedImages, ...(next?.images ?? [])];
 
 	return {
 		from: previous?.from ?? currentRange.from,

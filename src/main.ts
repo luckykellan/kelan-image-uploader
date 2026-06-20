@@ -1,5 +1,6 @@
 import {
 	Editor,
+	editorInfoField,
 	type MarkdownFileInfo,
 	MarkdownView,
 	Notice,
@@ -7,7 +8,8 @@ import {
 	Plugin,
 	type TFile,
 } from 'obsidian';
-import { createGalleryReplacement } from './gallery';
+import { EditorView, type ViewUpdate } from '@codemirror/view';
+import { createGalleryReplacement, createGalleryReplacementForImages, type GalleryImage } from './gallery';
 import { t } from './i18n';
 import {
 	DEFAULT_SETTINGS,
@@ -38,6 +40,11 @@ interface UploadTask {
 	placeholder: UploadPlaceholder;
 }
 
+interface UploadedImage {
+	placeholder: UploadPlaceholder;
+	image: GalleryImage;
+}
+
 interface OffsetRange {
 	from: number;
 	to: number;
@@ -57,26 +64,38 @@ interface NativeAttachmentScanResult {
 	hasUnresolvedImageEmbed: boolean;
 }
 
+interface NativeAttachmentQueue {
+	editor: Editor;
+	sourceFile: TFile;
+	ranges: OffsetRange[];
+	retryIndex: number;
+	processing: boolean;
+	timer: number | null;
+}
+
+interface UploadRangeResult {
+	range: OffsetRange;
+	image: GalleryImage | null;
+}
+
 const UPLOAD_CONCURRENCY = 3;
 const CHANGE_SOURCE = 'kelan-uploader';
 const PLACEHOLDER_PROTOCOL = 'kelan-uploader';
 const NATIVE_ATTACHMENT_EMBED = /!\[\[([^\]\r\n]+)\]\]/g;
+const NATIVE_ATTACHMENT_SCAN_DELAY = 120;
 const NATIVE_ATTACHMENT_RETRY_DELAYS = [500, 1500] as const;
 
 export default class ObsidianImageUploaderPlugin extends Plugin {
 	settings: ImageUploaderSettings = DEFAULT_SETTINGS;
 	private uploadSequence = 0;
-	private readonly editorContentSnapshots = new WeakMap<Editor, string>();
-	private processingNativeAttachmentEmbeds = false;
-	private readonly nativeAttachmentRetryTimers = new Set<number>();
+	private readonly nativeAttachmentQueues = new WeakMap<Editor, NativeAttachmentQueue>();
+	private readonly nativeAttachmentTimers = new Set<number>();
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
 		this.addSettingTab(new ImageUploaderSettingTab(this.app, this));
-		this.app.workspace.onLayoutReady(() => this.captureActiveEditorContent());
-		this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.captureActiveEditorContent()));
-		this.registerEvent(this.app.workspace.on('file-open', () => this.captureActiveEditorContent()));
-		this.register(() => this.clearNativeAttachmentRetryTimers());
+		this.registerEditorExtension(EditorView.updateListener.of((update) => this.handleEditorUpdate(update)));
+		this.register(() => this.clearNativeAttachmentTimers());
 
 		this.addCommand({
 			id: 'upload-images-from-device',
@@ -97,12 +116,6 @@ export default class ObsidianImageUploaderPlugin extends Plugin {
 					evt.stopPropagation();
 				},
 			),
-		);
-
-		this.registerEvent(
-			this.app.workspace.on('editor-change', (editor: Editor, info: MarkdownView | MarkdownFileInfo) => {
-				this.handleEditorChange(editor, info);
-			}),
 		);
 
 		this.registerEvent(
@@ -147,71 +160,122 @@ export default class ObsidianImageUploaderPlugin extends Plugin {
 		return true;
 	}
 
-	private handleEditorChange(editor: Editor, info: MarkdownView | MarkdownFileInfo): void {
-		const content = editor.getValue();
-		const previousContent = this.editorContentSnapshots.get(editor);
-		this.editorContentSnapshots.set(editor, content);
+	private handleEditorUpdate(update: ViewUpdate): void {
+		if (!update.docChanged) return;
 
-		if (this.processingNativeAttachmentEmbeds) return;
+		const info = update.state.field(editorInfoField, false);
+		const editor = info?.editor;
+		const sourceFile = info?.file;
+		if (!editor || !sourceFile) return;
 
-		const scanRanges = previousContent === undefined
-			? getCursorScanRanges(editor, content)
-			: getChangedScanRanges(previousContent, content);
-		if (scanRanges.length === 0) return;
+		const ranges = getChangedLineRanges(update);
+		if (!stateRangesContainNativeImageEmbed(update, ranges)) return;
 
-		void this.processNativeAttachmentEmbeds(editor, info, scanRanges, 0);
+		this.enqueueNativeAttachmentScan(editor, sourceFile, ranges, 0, NATIVE_ATTACHMENT_SCAN_DELAY);
+	}
+
+	private enqueueNativeAttachmentScan(
+		editor: Editor,
+		sourceFile: TFile,
+		ranges: OffsetRange[],
+		retryIndex: number,
+		delay: number,
+	): void {
+		if (ranges.length === 0) return;
+
+		let queue = this.nativeAttachmentQueues.get(editor);
+		if (!queue) {
+			queue = {
+				editor,
+				sourceFile,
+				ranges: [],
+				retryIndex,
+				processing: false,
+				timer: null,
+			};
+			this.nativeAttachmentQueues.set(editor, queue);
+		}
+
+		queue.sourceFile = sourceFile;
+		queue.retryIndex = retryIndex;
+		queue.ranges = mergeOffsetRanges([...queue.ranges, ...ranges]);
+		this.scheduleNativeAttachmentQueue(queue, delay);
+	}
+
+	private scheduleNativeAttachmentQueue(queue: NativeAttachmentQueue, delay: number): void {
+		if (queue.timer !== null) {
+			activeWindow.clearTimeout(queue.timer);
+			this.nativeAttachmentTimers.delete(queue.timer);
+		}
+
+		const timer = activeWindow.setTimeout(() => {
+			queue.timer = null;
+			this.nativeAttachmentTimers.delete(timer);
+			void this.flushNativeAttachmentQueue(queue);
+		}, delay);
+		queue.timer = timer;
+		this.nativeAttachmentTimers.add(timer);
+	}
+
+	private async flushNativeAttachmentQueue(queue: NativeAttachmentQueue): Promise<void> {
+		if (queue.processing) return;
+
+		const ranges = queue.ranges;
+		if (ranges.length === 0) return;
+
+		queue.ranges = [];
+		const retryIndex = queue.retryIndex;
+		queue.retryIndex = 0;
+		queue.processing = true;
+
+		try {
+			await this.processNativeAttachmentEmbeds(queue.editor, queue.sourceFile, ranges, retryIndex);
+		} finally {
+			queue.processing = false;
+			if (queue.ranges.length > 0) {
+				this.scheduleNativeAttachmentQueue(queue, 0);
+			}
+		}
 	}
 
 	private async processNativeAttachmentEmbeds(
 		editor: Editor,
-		info: MarkdownView | MarkdownFileInfo,
+		sourceFile: TFile,
 		scanRanges: OffsetRange[],
 		retryIndex: number,
-		sourceFileOverride?: TFile,
 	): Promise<void> {
-		if (this.processingNativeAttachmentEmbeds) return;
+		const content = editor.getValue();
+		const ranges = mergeOffsetRanges(scanRanges.map((range) => expandToLineRange(content, range)));
+		if (!rangesContainNativeImageEmbed(content, ranges)) return;
 
-		this.processingNativeAttachmentEmbeds = true;
-		try {
-			const content = editor.getValue();
-			const ranges = scanRanges.map((range) => expandToLineRange(content, range));
-			if (!rangesContainNativeImageEmbed(content, ranges)) return;
-
-			const validationError = validateUploadSettings(this.settings);
-			if (validationError) {
-				new Notice(validationError);
-				return;
-			}
-
-			const sourceFile = sourceFileOverride ?? info.file ?? this.app.workspace.getActiveFile();
-			if (!sourceFile) return;
-
-			const scanResult = await this.collectNativeAttachmentReplacements(content, sourceFile, ranges);
-			if (scanResult.hasUnresolvedImageEmbed) {
-				this.scheduleNativeAttachmentRescan(editor, info, sourceFile, ranges, retryIndex);
-			}
-			if (scanResult.replacements.length === 0) return;
-
-			const uploadTasks = scanResult.replacements.map((replacement) => ({
-				file: replacement.file,
-				placeholder: replacement.placeholder,
-			}));
-
-			for (const replacement of [...scanResult.replacements].sort((left, right) => right.from - left.from)) {
-				const from = editor.offsetToPos(replacement.from);
-				const to = editor.offsetToPos(replacement.to);
-				editor.replaceRange(replacement.placeholder.markdown, from, to, CHANGE_SOURCE);
-			}
-
-			this.editorContentSnapshots.set(editor, editor.getValue());
-			new Notice(t('notice.uploading', {
-				count: uploadTasks.length,
-				plural: uploadTasks.length === 1 ? '' : 's',
-			}));
-			void this.processUploads(editor, uploadTasks);
-		} finally {
-			this.processingNativeAttachmentEmbeds = false;
+		const validationError = validateUploadSettings(this.settings);
+		if (validationError) {
+			new Notice(validationError);
+			return;
 		}
+
+		const scanResult = await this.collectNativeAttachmentReplacements(content, sourceFile, ranges);
+		if (scanResult.hasUnresolvedImageEmbed) {
+			this.scheduleNativeAttachmentRescan(editor, sourceFile, ranges, retryIndex);
+		}
+		if (scanResult.replacements.length === 0) return;
+
+		const uploadTasks = scanResult.replacements.map((replacement) => ({
+			file: replacement.file,
+			placeholder: replacement.placeholder,
+		}));
+
+		for (const replacement of [...scanResult.replacements].sort((left, right) => right.from - left.from)) {
+			const from = editor.offsetToPos(replacement.from);
+			const to = editor.offsetToPos(replacement.to);
+			editor.replaceRange(replacement.placeholder.markdown, from, to, CHANGE_SOURCE);
+		}
+
+		new Notice(t('notice.uploading', {
+			count: uploadTasks.length,
+			plural: uploadTasks.length === 1 ? '' : 's',
+		}));
+		void this.processUploads(editor, uploadTasks);
 	}
 
 	private async collectNativeAttachmentReplacements(
@@ -219,7 +283,7 @@ export default class ObsidianImageUploaderPlugin extends Plugin {
 		sourceFile: TFile,
 		scanRanges: OffsetRange[],
 	): Promise<NativeAttachmentScanResult> {
-		const replacements: NativeAttachmentReplacement[] = [];
+		const targets: Array<NativeAttachmentEmbed & { targetFile: TFile }> = [];
 		let hasUnresolvedImageEmbed = false;
 
 		for (const embed of findNativeAttachmentEmbeds(content, scanRanges)) {
@@ -236,21 +300,29 @@ export default class ObsidianImageUploaderPlugin extends Plugin {
 			}
 			if (!isImageExtension(targetFile.extension)) continue;
 
-			try {
-				const file = await this.createFileFromVaultAttachment(targetFile);
-				replacements.push({
-					from: embed.from,
-					to: embed.to,
-					file,
-					placeholder: this.createPlaceholder(file),
-				});
-			} catch (error) {
-				new Notice(t('notice.uploadFailed', { message: getErrorMessage(error) }));
-			}
+			targets.push({
+				...embed,
+				targetFile,
+			});
 		}
 
+		const replacements = await Promise.all(targets.map(async (target): Promise<NativeAttachmentReplacement | null> => {
+			try {
+				const file = await this.createFileFromVaultAttachment(target.targetFile);
+				return {
+					from: target.from,
+					to: target.to,
+					file,
+					placeholder: this.createPlaceholder(file),
+				};
+			} catch (error) {
+				new Notice(t('notice.uploadFailed', { message: getErrorMessage(error) }));
+				return null;
+			}
+		}));
+
 		return {
-			replacements,
+			replacements: replacements.filter((replacement): replacement is NativeAttachmentReplacement => replacement !== null),
 			hasUnresolvedImageEmbed,
 		};
 	}
@@ -264,7 +336,6 @@ export default class ObsidianImageUploaderPlugin extends Plugin {
 
 	private scheduleNativeAttachmentRescan(
 		editor: Editor,
-		info: MarkdownView | MarkdownFileInfo,
 		sourceFile: TFile,
 		scanRanges: OffsetRange[],
 		retryIndex: number,
@@ -272,24 +343,14 @@ export default class ObsidianImageUploaderPlugin extends Plugin {
 		const delay = NATIVE_ATTACHMENT_RETRY_DELAYS[retryIndex];
 		if (delay === undefined) return;
 
-		const timer = activeWindow.setTimeout(() => {
-			this.nativeAttachmentRetryTimers.delete(timer);
-			void this.processNativeAttachmentEmbeds(editor, info, scanRanges, retryIndex + 1, sourceFile);
-		}, delay);
-		this.nativeAttachmentRetryTimers.add(timer);
+		this.enqueueNativeAttachmentScan(editor, sourceFile, scanRanges, retryIndex + 1, delay);
 	}
 
-	private captureActiveEditorContent(): void {
-		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-		if (!view) return;
-		this.editorContentSnapshots.set(view.editor, view.editor.getValue());
-	}
-
-	private clearNativeAttachmentRetryTimers(): void {
-		for (const timer of this.nativeAttachmentRetryTimers) {
+	private clearNativeAttachmentTimers(): void {
+		for (const timer of this.nativeAttachmentTimers) {
 			activeWindow.clearTimeout(timer);
 		}
-		this.nativeAttachmentRetryTimers.clear();
+		this.nativeAttachmentTimers.clear();
 	}
 
 	private openImagePicker(editor: Editor): void {
@@ -339,25 +400,53 @@ export default class ObsidianImageUploaderPlugin extends Plugin {
 	}
 
 	private async processUploads(editor: Editor, tasks: UploadTask[]): Promise<void> {
-		const concurrency = this.settings.autoInlineGallery ? 1 : UPLOAD_CONCURRENCY;
+		if (this.settings.autoInlineGallery) {
+			await this.processGalleryUploads(editor, tasks);
+			return;
+		}
 
-		await runWithConcurrency(tasks, concurrency, async (task) => {
+		await runWithConcurrency(tasks, UPLOAD_CONCURRENCY, async (task) => {
 			try {
-				const prepared = await prepareImageForUpload(task.file, this.settings.transform);
-				if (prepared.skippedTransformReason) {
-					new Notice(t('notice.transformSkipped', {
-						name: task.file.name || 'image',
-						reason: prepared.skippedTransformReason,
-					}));
-				}
-
-				const url = await uploadImage(prepared, this.settings);
-				this.replaceUploadedImage(editor, task.placeholder, url, prepared.fileName);
+				const uploaded = await this.uploadTask(task);
+				this.replaceUploadedImage(editor, uploaded.placeholder, uploaded.image.src, uploaded.image.alt);
 			} catch (error) {
 				this.replacePlaceholder(editor, task.placeholder, '');
 				new Notice(t('notice.uploadFailed', { message: getErrorMessage(error) }));
 			}
 		});
+	}
+
+	private async processGalleryUploads(editor: Editor, tasks: UploadTask[]): Promise<void> {
+		const results = new Array<UploadedImage | null>(tasks.length).fill(null);
+		const indexedTasks = tasks.map((task, index) => ({ task, index }));
+
+		await runWithConcurrency(indexedTasks, UPLOAD_CONCURRENCY, async ({ task, index }) => {
+			try {
+				results[index] = await this.uploadTask(task);
+			} catch (error) {
+				new Notice(t('notice.uploadFailed', { message: getErrorMessage(error) }));
+			}
+		});
+
+		this.replaceUploadedGalleryImages(editor, tasks, results);
+	}
+
+	private async uploadTask(task: UploadTask): Promise<UploadedImage> {
+		const prepared = await prepareImageForUpload(task.file, this.settings.transform);
+		if (prepared.skippedTransformReason) {
+			new Notice(t('notice.transformSkipped', {
+				name: task.file.name || 'image',
+				reason: prepared.skippedTransformReason,
+			}));
+		}
+
+		return {
+			placeholder: task.placeholder,
+			image: {
+				src: await uploadImage(prepared, this.settings),
+				alt: prepared.fileName,
+			},
+		};
 	}
 
 	private createPlaceholder(file: File): UploadPlaceholder {
@@ -400,6 +489,43 @@ export default class ObsidianImageUploaderPlugin extends Plugin {
 		return true;
 	}
 
+	private replaceUploadedGalleryImages(
+		editor: Editor,
+		tasks: UploadTask[],
+		results: Array<UploadedImage | null>,
+	): void {
+		const content = editor.getValue();
+		const rangedResults = tasks.flatMap((task, index): UploadRangeResult[] => {
+			const range = findPlaceholderRange(content, task.placeholder);
+			if (!range) return [];
+			return [{
+				range,
+				image: results[index]?.image ?? null,
+			}];
+		});
+		if (rangedResults.length === 0) return;
+
+		const groups = groupUploadRangeResults(content, rangedResults);
+		for (const group of groups.reverse()) {
+			const groupFrom = group[0]?.range.from;
+			const groupTo = group[group.length - 1]?.range.to;
+			if (groupFrom === undefined || groupTo === undefined) continue;
+
+			const images = group.flatMap((entry) => entry.image ? [entry.image] : []);
+			const replacement = images.length === 0
+				? { from: groupFrom, to: groupTo, text: '' }
+				: createGalleryReplacementForImages(
+					content,
+					{ from: groupFrom, to: groupTo },
+					images,
+					{ imageHeight: this.settings.autoInlineGalleryHeight },
+				);
+			const from = editor.offsetToPos(replacement.from);
+			const to = editor.offsetToPos(replacement.to);
+			editor.replaceRange(replacement.text, from, to, CHANGE_SOURCE);
+		}
+	}
+
 	private replacePlaceholder(editor: Editor, placeholder: UploadPlaceholder, replacement: string): boolean {
 		const content = editor.getValue();
 		const range = findPlaceholderRange(content, placeholder);
@@ -412,53 +538,37 @@ export default class ObsidianImageUploaderPlugin extends Plugin {
 	}
 }
 
-function getChangedScanRanges(previousContent: string, content: string): OffsetRange[] {
-	const changedRange = getChangedRange(previousContent, content);
-	if (!changedRange) return [];
+function getChangedLineRanges(update: ViewUpdate): OffsetRange[] {
+	const ranges: OffsetRange[] = [];
 
-	const scanRange = expandToLineRange(content, changedRange);
-	return rangesContainNativeImageEmbed(content, [scanRange]) ? [scanRange] : [];
+	update.changes.iterChangedRanges((_fromA, _toA, fromB, toB) => {
+		if (fromB === toB) return;
+
+		const doc = update.state.doc;
+		const startLine = doc.lineAt(clampOffset(fromB, doc.length));
+		const endLine = doc.lineAt(clampOffset(Math.max(fromB, toB - 1), doc.length));
+		ranges.push({
+			from: startLine.from,
+			to: endLine.to,
+		});
+	}, true);
+
+	return mergeOffsetRanges(ranges);
 }
 
-function getChangedRange(previousContent: string, content: string): OffsetRange | null {
-	if (previousContent === content) return null;
-
-	let prefixLength = 0;
-	const minLength = Math.min(previousContent.length, content.length);
-	while (
-		prefixLength < minLength &&
-		previousContent[prefixLength] === content[prefixLength]
-	) {
-		prefixLength += 1;
-	}
-
-	let previousSuffixStart = previousContent.length;
-	let contentSuffixStart = content.length;
-	while (
-		previousSuffixStart > prefixLength &&
-		contentSuffixStart > prefixLength &&
-		previousContent[previousSuffixStart - 1] === content[contentSuffixStart - 1]
-	) {
-		previousSuffixStart -= 1;
-		contentSuffixStart -= 1;
-	}
-
-	if (contentSuffixStart <= prefixLength) return null;
-	return {
-		from: prefixLength,
-		to: contentSuffixStart,
-	};
+function stateRangesContainNativeImageEmbed(update: ViewUpdate, ranges: OffsetRange[]): boolean {
+	return ranges.some((range) => rangeContainsNativeImageEmbed(update.state.sliceDoc(range.from, range.to)));
 }
 
-function getCursorScanRanges(editor: Editor, content: string): OffsetRange[] {
-	const cursorOffset = editor.posToOffset(editor.getCursor());
-	if (cursorOffset < 0) return [];
-
-	const scanRange = expandToLineRange(content, {
-		from: Math.min(cursorOffset, content.length),
-		to: Math.min(cursorOffset, content.length),
-	});
-	return rangesContainNativeImageEmbed(content, [scanRange]) ? [scanRange] : [];
+function rangeContainsNativeImageEmbed(value: string): boolean {
+	NATIVE_ATTACHMENT_EMBED.lastIndex = 0;
+	let match: RegExpExecArray | null;
+	while ((match = NATIVE_ATTACHMENT_EMBED.exec(value)) !== null) {
+		const linkPath = getWikilinkPath(match[1] ?? '');
+		const extension = linkPath ? getExtension(linkPath) : null;
+		if (extension !== null && isImageExtension(extension)) return true;
+	}
+	return false;
 }
 
 function expandToLineRange(content: string, range: OffsetRange): OffsetRange {
@@ -508,6 +618,62 @@ function findNativeAttachmentEmbeds(content: string, ranges: OffsetRange[]): Nat
 	}
 
 	return embeds.sort((left, right) => left.from - right.from);
+}
+
+function groupUploadRangeResults(content: string, results: UploadRangeResult[]): UploadRangeResult[][] {
+	const sorted = [...results].sort((left, right) => left.range.from - right.range.from);
+	const groups: UploadRangeResult[][] = [];
+
+	for (const result of sorted) {
+		const previousGroup = groups[groups.length - 1];
+		const previousResult = previousGroup?.[previousGroup.length - 1];
+		if (
+			previousGroup &&
+			previousResult &&
+			isMergeablePlaceholderGap(content.slice(previousResult.range.to, result.range.from))
+		) {
+			previousGroup.push(result);
+			continue;
+		}
+		groups.push([result]);
+	}
+
+	return groups;
+}
+
+function isMergeablePlaceholderGap(value: string): boolean {
+	if (value.trim()) return false;
+	return countLineBreaks(value) < 2;
+}
+
+function countLineBreaks(value: string): number {
+	let count = 0;
+	for (let index = 0; index < value.length; index += 1) {
+		const char = value[index];
+		if (char === '\r') {
+			count += 1;
+			if (value[index + 1] === '\n') index += 1;
+			continue;
+		}
+		if (char === '\n') count += 1;
+	}
+	return count;
+}
+
+function mergeOffsetRanges(ranges: OffsetRange[]): OffsetRange[] {
+	const sorted = [...ranges].sort((left, right) => left.from - right.from || left.to - right.to);
+	const merged: OffsetRange[] = [];
+
+	for (const range of sorted) {
+		const previous = merged[merged.length - 1];
+		if (!previous || range.from > previous.to) {
+			merged.push({ ...range });
+			continue;
+		}
+		previous.to = Math.max(previous.to, range.to);
+	}
+
+	return merged;
 }
 
 function getWikilinkPath(linktext: string): string | null {
