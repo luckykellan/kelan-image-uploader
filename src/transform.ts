@@ -1,3 +1,7 @@
+import encodeWebp, { init as initWebpEncoder } from '@jsquash/webp/encode';
+import webpEncoderWasm from '@jsquash/webp/codec/enc/webp_enc.wasm';
+import webpEncoderSimdWasm from '@jsquash/webp/codec/enc/webp_enc_simd.wasm';
+import { simd } from 'wasm-feature-detect';
 import { ImageTransformSettings, OutputFormat } from './settings';
 import { getExtension, getMimeTypeByExtension, replaceExtension } from './utils';
 
@@ -16,6 +20,15 @@ interface LoadedImage {
 }
 
 const ENCODABLE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+const WEBP_MIME_TYPE = 'image/webp';
+
+type WebpEncoderInit = (
+	module: WebAssembly.Module,
+) => Promise<unknown>;
+
+const initWebpEncoderWithModule = initWebpEncoder as unknown as WebpEncoderInit;
+let webpEncoderReady: Promise<void> | null = null;
+
 export async function prepareImageForUpload(
 	file: File,
 	settings: ImageTransformSettings,
@@ -46,7 +59,7 @@ export async function prepareImageForUpload(
 
 		context.drawImage(image.source, 0, 0, canvas.width, canvas.height);
 
-		const output = await canvasToBlob(canvas, targetMimeType, settings.quality);
+		const output = await canvasToEncodedBlob(canvas, context, targetMimeType, settings.quality);
 		if (output.type !== targetMimeType) {
 			throw new Error(`This environment cannot encode ${targetMimeType}.`);
 		}
@@ -158,6 +171,51 @@ function fitWithin(
 	};
 }
 
+async function canvasToEncodedBlob(
+	canvas: HTMLCanvasElement,
+	context: CanvasRenderingContext2D,
+	mimeType: string,
+	quality: number,
+): Promise<Blob> {
+	if (mimeType === WEBP_MIME_TYPE) {
+		return canvasToWebpBlob(canvas, context, quality);
+	}
+
+	return canvasToBlob(canvas, mimeType, quality);
+}
+
+async function canvasToWebpBlob(
+	canvas: HTMLCanvasElement,
+	context: CanvasRenderingContext2D,
+	quality: number,
+): Promise<Blob> {
+	await initializeWebpEncoder();
+	const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+	const encoded = await encodeWebp(imageData, { quality: toWebpQuality(quality) });
+	return new Blob([encoded], { type: WEBP_MIME_TYPE });
+}
+
+async function initializeWebpEncoder(): Promise<void> {
+	if (!webpEncoderReady) {
+		webpEncoderReady = (async () => {
+			const wasmBytes = await simd() ? webpEncoderSimdWasm : webpEncoderWasm;
+			const module = await WebAssembly.compile(toArrayBuffer(wasmBytes));
+			await initWebpEncoderWithModule(module);
+		})();
+	}
+	return webpEncoderReady;
+}
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+	const buffer = new ArrayBuffer(bytes.byteLength);
+	new Uint8Array(buffer).set(bytes);
+	return buffer;
+}
+
+function toWebpQuality(quality: number): number {
+	return Math.round(quality * 100);
+}
+
 function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string, quality: number): Promise<Blob> {
 	return new Promise((resolve, reject) => {
 		canvas.toBlob(
@@ -177,7 +235,7 @@ function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string, quality: numb
 function getTargetMimeType(file: File, outputFormat: OutputFormat): string {
 	if (outputFormat === 'jpeg') return 'image/jpeg';
 	if (outputFormat === 'png') return 'image/png';
-	if (outputFormat === 'webp') return 'image/webp';
+	if (outputFormat === 'webp') return WEBP_MIME_TYPE;
 	return getOriginalMimeType(file);
 }
 
@@ -211,7 +269,7 @@ function getFallbackFileNameFromMime(mimeType: string): string {
 function getExtensionForMime(mimeType: string): string {
 	if (mimeType === 'image/jpeg') return 'jpg';
 	if (mimeType === 'image/png') return 'png';
-	if (mimeType === 'image/webp') return 'webp';
+	if (mimeType === WEBP_MIME_TYPE) return 'webp';
 	if (mimeType === 'image/gif') return 'gif';
 	if (mimeType === 'image/heic') return 'heic';
 	if (mimeType === 'image/heif') return 'heif';

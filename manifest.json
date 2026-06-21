@@ -1,7 +1,7 @@
 {
 	"id": "kelan-uploader",
 	"name": "Kelan Image Uploader",
-	"version": "1.0.10",
+	"version": "1.1.0",
 	"minAppVersion": "1.8.7",
 	"description": "Automatically transform selected, pasted, dropped, or attached images, upload them to a configurable API, and insert the returned URL.",
 	"author": "lifeisstrange",
