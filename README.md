@@ -10,6 +10,7 @@ An Obsidian plugin for uploading selected, pasted, dropped, or Obsidian-native a
 - Use any compatible `multipart/form-data` upload endpoint.
 - Extract the final URL from JSON responses with paths such as `url`, `data.link`, or `0.src`.
 - Optional resize, compression, and JPEG/PNG/WebP conversion.
+- WebP conversion uses the bundled WebAssembly encoder, including on Obsidian Mobile environments where canvas WebP encoding is unavailable.
 - Preserve SVG, animated GIF, ICO, and other unsupported transform targets as original files.
 - Upload multiple images while preserving insertion order.
 - Auto inline gallery: when enabled, adjacent Markdown or gallery images with no blank line are merged into a fixed-height wrapping gallery.
@@ -55,6 +56,8 @@ Reload Obsidian and enable **Kelan Image Uploader** in Community plugins.
 | Gallery image height | Height used by auto inline gallery images. Width follows each image's aspect ratio. |
 
 `Content-Type` is generated automatically for multipart upload and cannot be overridden.
+
+The upload API response must be JSON, and **Image URL path** must resolve to a non-empty string URL. For example, a response such as `{"data":{"link":"https://example.com/a.webp"}}` uses `data.link`.
 
 ## Mobile
 

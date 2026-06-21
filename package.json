@@ -1,7 +1,7 @@
 {
 	"name": "kelan-uploader",
-	"version": "1.1.1",
-	"description": "Automatically transform selected, pasted, dropped, or attached Obsidian images, upload them to a configurable API, and insert the returned URL.",
+	"version": "1.1.2",
+	"description": "Resize, compress, or convert selected, pasted, dropped, and native Obsidian attachment images, upload them to your configured API, and insert the returned URL.",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {

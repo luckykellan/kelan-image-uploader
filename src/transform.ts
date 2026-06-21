@@ -1,7 +1,7 @@
-import encodeWebp, { init as initWebpEncoder } from '@jsquash/webp/encode';
+import webpEncoderFactory, { type WebPModule } from '@jsquash/webp/codec/enc/webp_enc.js';
 import webpEncoderWasm from '@jsquash/webp/codec/enc/webp_enc.wasm';
-import webpEncoderSimdWasm from '@jsquash/webp/codec/enc/webp_enc_simd.wasm';
-import { simd } from 'wasm-feature-detect';
+import { defaultOptions } from '@jsquash/webp/meta.js';
+import { initEmscriptenModule } from '@jsquash/webp/utils.js';
 import { ImageTransformSettings, OutputFormat } from './settings';
 import { getExtension, getMimeTypeByExtension, replaceExtension } from './utils';
 
@@ -22,18 +22,8 @@ interface LoadedImage {
 const ENCODABLE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const WEBP_MIME_TYPE = 'image/webp';
 
-type WebpEncoderInit = (
-	module: WebAssembly.Module,
-	moduleOptionOverrides?: WebpEncoderModuleOptions,
-) => Promise<unknown>;
-
-interface WebpEncoderModuleOptions {
-	locateFile(path: string, prefix: string): string;
-}
-
-const initWebpEncoderWithModule = initWebpEncoder as unknown as WebpEncoderInit;
-let webpEncoderReady: Promise<void> | null = null;
 const EMBEDDED_WEBP_WASM_URL = 'data:application/octet-stream;base64,';
+let webpEncoderModule: Promise<WebPModule> | null = null;
 
 export async function prepareImageForUpload(
 	file: File,
@@ -195,23 +185,35 @@ async function canvasToWebpBlob(
 	context: CanvasRenderingContext2D,
 	quality: number,
 ): Promise<Blob> {
-	await initializeWebpEncoder();
 	const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-	const encoded = await encodeWebp(imageData, { quality: toWebpQuality(quality) });
-	return new Blob([encoded], { type: WEBP_MIME_TYPE });
+	const encoded = await encodeWebp(imageData, quality);
+	return new Blob([toArrayBuffer(encoded)], { type: WEBP_MIME_TYPE });
 }
 
-async function initializeWebpEncoder(): Promise<void> {
-	if (!webpEncoderReady) {
-		webpEncoderReady = (async () => {
-			const wasmBytes = await simd() ? webpEncoderSimdWasm : webpEncoderWasm;
-			const module = await WebAssembly.compile(toArrayBuffer(wasmBytes));
-			await initWebpEncoderWithModule(module, {
-				locateFile: () => EMBEDDED_WEBP_WASM_URL,
-			});
-		})();
+async function encodeWebp(imageData: ImageData, quality: number): Promise<Uint8Array> {
+	const module = await initializeWebpEncoder();
+	const encoded = module.encode(imageData.data, imageData.width, imageData.height, {
+		...defaultOptions,
+		quality: toWebpQuality(quality),
+	});
+	if (!encoded) throw new Error(`Could not encode image as ${WEBP_MIME_TYPE}.`);
+	return encoded;
+}
+
+async function initializeWebpEncoder(): Promise<WebPModule> {
+	let module = webpEncoderModule;
+	if (!module) {
+		module = createWebpEncoderModule();
+		webpEncoderModule = module;
 	}
-	return webpEncoderReady;
+	return module;
+}
+
+async function createWebpEncoderModule(): Promise<WebPModule> {
+	const module = await WebAssembly.compile(toArrayBuffer(webpEncoderWasm));
+	return initEmscriptenModule<WebPModule>(webpEncoderFactory, module, {
+		locateFile: () => EMBEDDED_WEBP_WASM_URL,
+	});
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {

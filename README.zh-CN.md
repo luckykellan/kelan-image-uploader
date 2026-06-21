@@ -10,6 +10,7 @@
 - 支持任意兼容 `multipart/form-data` 的上传接口。
 - 可通过 `url`、`data.link`、`0.src` 等路径从 JSON 返回值中提取图片地址。
 - 可选图片缩放、压缩，以及 JPEG/PNG/WebP 格式转换。
+- WebP 转换使用插件内置的 WebAssembly 编码器，包括手机端 canvas 不支持 WebP 编码的环境。
 - SVG、动图 GIF、ICO 等不适合转换的格式会保留原文件上传。
 - 多图上传时保持插入顺序。
 - 自动同排图片：开启后，没有空行隔开的相邻 Markdown 图片或同排图片会合并为固定高度、可换行的图片流。
@@ -55,6 +56,8 @@
 | 同排图片高度 | 自动同排图片使用的高度，宽度按图片原始比例缩放。 |
 
 `Content-Type` 会由上传请求自动生成，不能在设置中手动覆盖。
+
+上传接口必须返回 JSON，并且 **图片 URL 路径** 必须能解析到非空字符串 URL。例如返回 `{"data":{"link":"https://example.com/a.webp"}}` 时，路径应填写 `data.link`。
 
 ## 手机端
 
